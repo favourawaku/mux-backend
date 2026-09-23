@@ -1,4 +1,5 @@
 import { Reflector } from '@nestjs/core';
+import { UnauthorizedException } from '@nestjs/common';
 import { ApiKeyGuard, REQUIRE_API_KEY, IS_PUBLIC } from './api-key.guard';
 import { ApiKeyService } from './api-key.service';
 
@@ -142,6 +143,9 @@ describe('ApiKeyGuard', () => {
       path: '/horizon/import/cursor',
       method: 'POST',
       ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
+      query: { userId: 'attacker-supplied-id' },
+      body: { userId: 'attacker-supplied-id' },
     };
 
     const context: any = {
@@ -173,6 +177,7 @@ describe('ApiKeyGuard', () => {
       path: '/horizon/import/cursor',
       method: 'POST',
       ip: '127.0.0.1',
+      socket: { remoteAddress: '127.0.0.1' },
     };
 
     const context: any = {

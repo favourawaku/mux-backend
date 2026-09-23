@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 
 /**
  * Structured error response format
@@ -20,7 +21,7 @@ export interface ErrorResponse {
   error?: string;
   errorCode?: string;
   details?: Record<string, any>;
-  requestId?: string;
+  requestId: string;
 }
 
 /**
@@ -31,6 +32,7 @@ export interface ErrorResponse {
  * - Consistent error structure across all endpoints
  * - Proper HTTP status codes
  * - Request context (path, method, timestamp)
+ * - requestId correlation on every error response and log line
  * - Error logging with context
  * - Security: No stack traces or sensitive data in production
  * - Support for validation errors and custom error details
@@ -44,7 +46,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
     const response = ctx.getResponse<Response>();
     const request = ctx.getRequest<Request>();
 
-    const errorResponse = this.buildErrorResponse(exception, request);
+    const requestId = this.resolveRequestId(request);
+    const errorResponse = this.buildErrorResponse(exception, request, requestId);
 
     // Log error with context
     this.logError(exception, request, errorResponse);
@@ -54,11 +57,27 @@ export class HttpExceptionFilter implements ExceptionFilter {
   }
 
   /**
+   * Resolve the correlation id for the current request, generating one when
+   * the client did not supply a valid `x-request-id` header.
+   */
+  private resolveRequestId(request: Request): string {
+    const header = request.headers['x-request-id'];
+    const incoming = Array.isArray(header) ? header[0] : header;
+
+    if (typeof incoming === 'string' && incoming.trim().length > 0) {
+      return incoming.trim();
+    }
+
+    return randomUUID();
+  }
+
+  /**
    * Build a structured error response from any exception type
    */
   private buildErrorResponse(
     exception: unknown,
     request: Request,
+    requestId: string,
   ): ErrorResponse {
     const timestamp = new Date().toISOString();
     const path = request.url;
@@ -82,9 +101,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
         error,
         ...(errorCode && { errorCode }),
         ...(details && { details }),
-        ...(request.headers['x-request-id'] && {
-          requestId: request.headers['x-request-id'] as string,
-        }),
+        requestId,
       };
     }
 
@@ -97,9 +114,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
         method,
         message: this.sanitizeErrorMessage(exception.message),
         error: 'Internal Server Error',
-        ...(request.headers['x-request-id'] && {
-          requestId: request.headers['x-request-id'] as string,
-        }),
+        requestId,
       };
     }
 
@@ -111,9 +126,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
       method,
       message: 'An unexpected error occurred',
       error: 'Internal Server Error',
-      ...(request.headers['x-request-id'] && {
-        requestId: request.headers['x-request-id'] as string,
-      }),
+      requestId,
     };
   }
 
@@ -132,7 +145,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     // If response is a string, use it as the message
     if (typeof exceptionResponse === 'string') {
       return {
-        message: exceptionResponse,
+        message: this.sanitizeMessage(exceptionResponse, status),
         error: this.getErrorNameFromStatus(status),
       };
     }
@@ -141,7 +154,10 @@ export class HttpExceptionFilter implements ExceptionFilter {
     const responseObj = exceptionResponse as any;
 
     return {
-      message: responseObj.message || 'An error occurred',
+      message: this.sanitizeMessage(
+        responseObj.message || 'An error occurred',
+        status,
+      ),
       error: responseObj.error || this.getErrorNameFromStatus(status),
       ...(responseObj.errorCode && { errorCode: responseObj.errorCode }),
       ...(responseObj.details && { details: responseObj.details }),
@@ -170,6 +186,26 @@ export class HttpExceptionFilter implements ExceptionFilter {
   }
 
   /**
+   * Sanitize an error message (string or array) for the outgoing envelope.
+   * In production, server errors are replaced with a generic message so that
+   * internal details, stack traces, secrets, JWTs, or key material never leak.
+   */
+  private sanitizeMessage(
+    message: string | string[],
+    status: number,
+  ): string | string[] {
+    if (Array.isArray(message)) {
+      return message.map((entry) => this.sanitizeMessage(entry, status) as string);
+    }
+
+    if (process.env.NODE_ENV === 'production' && status >= 500) {
+      return 'Internal Server Error';
+    }
+
+    return this.sanitizeErrorMessage(message);
+  }
+
+  /**
    * Sanitize error messages to prevent sensitive data leakage
    */
   private sanitizeErrorMessage(message: string): string {
@@ -184,6 +220,14 @@ export class HttpExceptionFilter implements ExceptionFilter {
       message = message.replace(/api[_-]?key[:\s=]+[^\s]+/gi, '[API_KEY]');
       message = message.replace(/secret[:\s=]+[^\s]+/gi, '[SECRET]');
       message = message.replace(/password[:\s=]+[^\s]+/gi, '[PASSWORD]');
+      // Remove bearer tokens / JWTs
+      message = message.replace(/bearer\s+[A-Za-z0-9._-]+/gi, '[TOKEN]');
+      message = message.replace(
+        /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+        '[JWT]',
+      );
+      // Remove raw private/secret key material
+      message = message.replace(/S[A-Z2-7]{55}/g, '[STELLAR_KEY]');
     }
 
     return message;
@@ -197,8 +241,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     request: Request,
     errorResponse: ErrorResponse,
   ): void {
-    const { statusCode, path, method, message } = errorResponse;
-    const requestId = request.headers['x-request-id'] || 'N/A';
+    const { statusCode, path, method, message, requestId } = errorResponse;
 
     // Build log context
     const logContext = {

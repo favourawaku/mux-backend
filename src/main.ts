@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
@@ -6,7 +7,6 @@ import requestLogger from './common/middleware/request-logging.middleware';
 import { configureBodySizeLimit } from './common/http/body-size-limit';
 import { validateEnv } from './config/env.validation';
 import { IsoUtcTimestampInterceptor } from './common/interceptors';
-import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 
 /**
  * Parses the CORS_ALLOWED_ORIGINS env var into an array of allowed origins.
@@ -28,6 +28,8 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
+  // Apply the configurable JSON body size limit. Oversized payloads are
+  // rejected with a stable 413 error envelope (code + correlation id).
   configureBodySizeLimit(app, env.JSON_BODY_LIMIT_BYTES);
 
   // Configure CORS with credentials support
@@ -67,9 +69,6 @@ async function bootstrap() {
   // Normalize all Date values in HTTP responses to ISO 8601 UTC strings.
   app.useGlobalInterceptors(new IsoUtcTimestampInterceptor());
 
-  // Apply global exception filter for structured error responses
-  app.useGlobalFilters(new HttpExceptionFilter());
-
   // Let Nest call onModuleDestroy/beforeApplicationShutdown on SIGTERM/SIGINT
   // so in-flight requests can finish and connections (Prisma, etc.) close cleanly.
   app.enableShutdownHooks();
@@ -79,3 +78,5 @@ async function bootstrap() {
 }
 
 bootstrap();
+=======
+>>>>>>> upstream/staging

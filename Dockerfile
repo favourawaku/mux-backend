@@ -34,4 +34,11 @@ ENV GIT_SHA=$GIT_SHA
 
 EXPOSE 3000
 
+# Copy entrypoint script that runs `prisma migrate deploy` before the app
+# starts. If migrations fail the container exits non-zero so orchestrators
+# (Kubernetes, ECS) can detect the failure immediately.
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["node", "dist/main"]

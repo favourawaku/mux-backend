@@ -3,6 +3,9 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
+  ServiceUnavailableException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
@@ -37,6 +40,28 @@ const ALLOWED_TRANSITIONS: Record<string, PaymentStatus[]> = {
   [PaymentStatus.FAILED]: [],
 };
 
+// Stable, typed error codes for the payment write path. Clients can branch on
+// these without parsing human-readable messages.
+export const PaymentErrorCode = {
+  IDEMPOTENCY_CONFLICT: 'PAYMENT_IDEMPOTENCY_CONFLICT',
+  IDEMPOTENCY_IN_PROGRESS: 'PAYMENT_IDEMPOTENCY_IN_PROGRESS',
+  DEPENDENCY_UNAVAILABLE: 'PAYMENT_DEPENDENCY_UNAVAILABLE',
+  MAINNET_PAYMENTS_DISABLED: 'PAYMENT_MAINNET_DISABLED',
+} as const;
+
+export type PaymentErrorCode =
+  (typeof PaymentErrorCode)[keyof typeof PaymentErrorCode];
+
+// Prisma unique-constraint violation code.
+const PRISMA_UNIQUE_VIOLATION = 'P2002';
+
+// Env var that gates mainnet payment writes. Default OFF (fail-closed):
+// mainnet payments are denied unless explicitly enabled by an operator.
+export const MAINNET_PAYMENTS_ENABLED_ENV = 'MAINNET_PAYMENTS_ENABLED';
+
+// Stellar network identifiers used to decide whether a payment targets mainnet.
+const MAINNET_NETWORK_IDS = new Set(['mainnet', 'public', 'pubnet']);
+
 @Injectable()
 export class PaymentsService {
   private readonly logger = new StructuredLogger(PaymentsService.name);
@@ -55,12 +80,75 @@ export class PaymentsService {
   ) {}
 
   /**
+   * Whether mainnet payment writes are enabled. Fail-closed: any value other
+   * than an explicit truthy flag keeps mainnet payments disabled.
+   */
+  isMainnetPaymentsEnabled(): boolean {
+    const raw = this.configService.get<string>(MAINNET_PAYMENTS_ENABLED_ENV);
+    return raw === 'true' || raw === '1';
+  }
+
+  /**
+   * Resolve the effective network for a payment. Testnet is the default so
+   * testnet behavior is unchanged; only an explicit mainnet network is gated.
+   */
+  private resolveNetwork(createPaymentDto: CreatePaymentDto): string {
+    const configured =
+      this.configService.get<string>('STELLAR_NETWORK') ??
+      this.configService.get<string>('NETWORK');
+    const requested =
+      (createPaymentDto as { network?: string }).network ?? configured;
+    return (requested ?? 'testnet').toLowerCase();
+  }
+
+  private isMainnetPayment(createPaymentDto: CreatePaymentDto): boolean {
+    return MAINNET_NETWORK_IDS.has(this.resolveNetwork(createPaymentDto));
+  }
+
+  /**
+   * Deny-by-default guard for the mainnet money path. Throws a stable, typed
+   * error when a mainnet payment is attempted while the flag is off.
+   */
+  private assertMainnetPaymentAllowed(createPaymentDto: CreatePaymentDto): void {
+    if (!this.isMainnetPayment(createPaymentDto)) {
+      return;
+    }
+    if (this.isMainnetPaymentsEnabled()) {
+      return;
+    }
+
+    const requestId = this.requestContext.getRequestId();
+    this.logger.logWithContext('Mainnet payment denied by feature flag', {
+      requestId,
+      entityType: 'payment',
+      operation: 'create',
+      outcome: 'denied',
+      reason: PaymentErrorCode.MAINNET_PAYMENTS_DISABLED,
+    });
+    this.metrics.incrementPaymentMainnetDenied();
+    this.paymentMetrics.record({
+      operation: 'create',
+      outcome: 'denied',
+      durationMs: 0,
+      currency: createPaymentDto.currency,
+      failureReason: PaymentErrorCode.MAINNET_PAYMENTS_DISABLED,
+    });
+
+    throw new ForbiddenException({
+      code: PaymentErrorCode.MAINNET_PAYMENTS_DISABLED,
+      message: 'Mainnet payments are disabled',
+      requestId,
+    });
+  }
+
+  /**
    * Validate a payment exactly as creation does, without signing, submitting,
    * persisting a payment, or emitting a domain event.
    */
   async dryRun(
     createPaymentDto: CreatePaymentDto,
   ): Promise<PaymentDryRunResponseDto> {
+    this.assertMainnetPaymentAllowed(createPaymentDto);
     await this.validateForCreation(createPaymentDto);
 
     return {
@@ -99,6 +187,9 @@ export class PaymentsService {
       description,
       idempotencyKey,
     } = createPaymentDto;
+
+    // Fail-closed mainnet gate runs before any persistence or signing.
+    this.assertMainnetPaymentAllowed(createPaymentDto);
 
     if (idempotencyKey) {
       const existing = await this.prisma.payment.findUnique({
@@ -161,171 +252,62 @@ export class PaymentsService {
 
       return payment;
     } catch (err) {
+      // Concurrent/replayed request raced past the pre-check and lost the
+      // unique-constraint race on idempotencyKey. Return the original result
+      // so the write path is exactly-once instead of surfacing a 500.
+      if (
+        idempotencyKey &&
+        err?.code === PRISMA_UNIQUE_VIOLATION &&
+        this.isIdempotencyKeyViolation(err)
+      ) {
+        const existing = await this.prisma.payment.findUnique({
+          where: { idempotencyKey },
+        });
+        if (existing) {
+          this.logger.logWithContext(
+            'Idempotency conflict resolved to existing payment',
+            {
+              requestId,
+              clientVersion,
+              entityId: existing.id.toString(),
+              entityType: 'payment',
+              operation: 'create',
+              outcome: 'idempotent',
+            },
+          );
+          this.metrics.incrementPaymentIdempotencyHit();
+          this.paymentMetrics.record({
+            operation: 'create',
+            outcome: 'idempotent',
+            durationMs: Date.now() - start,
+            currency,
+          });
+          return existing;
+        }
+        // The conflicting row is not visible yet (in-flight transaction).
+        // Fail closed with a stable, retryable error code.
+        this.metrics.incrementPaymentIdempotencyConflict();
+        this.paymentMetrics.record({
+          operation: 'create',
+          outcome: 'conflict',
+          durationMs: Date.now() - start,
+          currency,
+          failureReason: PaymentErrorCode.IDEMPOTENCY_IN_PROGRESS,
+        });
+        throw new ConflictException({
+          code: PaymentErrorCode.IDEMPOTENCY_IN_PROGRESS,
+          message:
+            'A payment with this idempotency key is already being processed',
+          requestId,
+        });
+      }
+
       this.paymentMetrics.record({
         operation: 'create',
         outcome: 'failure',
         durationMs: Date.now() - start,
         currency,
         failureReason: err?.constructor?.name ?? 'unknown',
-      });
-      throw err;
-    }
-  }
+      })
 
-  async createBatch(dto: BatchPaymentDto) {
-    // The BatchPaymentDto enforces ArrayMinSize(1) via class-validator so this
-    // guard is a safety net for callers that bypass the validation pipe.
-    if (!dto.payments || dto.payments.length === 0) {
-      throw new BadRequestException('payments must not be empty');
-    }
-    return Promise.all(dto.payments.map((p) => this.create(p)));
-  }
-
-  private async validateForCreation(
-    createPaymentDto: CreatePaymentDto,
-  ): Promise<void> {
-    const { walletId, receiverWalletId, fromId, toId, amount } =
-      createPaymentDto;
-    const senderWallet = await retryWithBackoff(
-      () => this.walletsService.findWalletById(walletId),
-      3,
-      100,
-      this.logger,
-    );
-    if (senderWallet.status !== WalletStatus.ACTIVE) {
-      throw new BadRequestException(
-        `Sender wallet is not active (status: ${senderWallet.status})`,
-      );
-    }
-
-    const blockSelfPayments = this.configService.get<boolean>(
-      'BLOCK_SELF_PAYMENTS',
-      false,
-    );
-    if (blockSelfPayments && fromId === toId) {
-      throw new BadRequestException('Payments to self are not allowed');
-    }
-
-    await retryWithBackoff(
-      () => this.walletsService.findWalletById(receiverWalletId),
-      3,
-      100,
-      this.logger,
-    );
-    await retryWithBackoff(
-      () => this.paymentLimitsPort.checkLimits(walletId, amount),
-      3,
-      100,
-      this.logger,
-    );
-  }
-
-  async findAll(
-    pagination: PaginationDto,
-    filters: PaymentsFilterDto,
-  ): Promise<PaginatedResponse<any>> {
-    const skip = (pagination.page - 1) * pagination.limit;
-
-    const where: any = {};
-    if (filters.status) {
-      where.status = filters.status;
-    }
-
-    const [data, total] = await Promise.all([
-      this.prisma.payment.findMany({
-        where,
-        skip,
-        take: pagination.limit,
-      }),
-      this.prisma.payment.count({ where }),
-    ]);
-
-    return {
-      data,
-      total,
-      page: pagination.page,
-      limit: pagination.limit,
-    };
-  }
-
-  findOne(id: string) {
-    return this.prisma.payment.findUnique({
-      where: { id: parseInt(id, 10) },
-    });
-  }
-
-  async update(id: string, updatePaymentDto: UpdatePaymentDto) {
-    const requestId = this.requestContext.getRequestId();
-    const clientVersion = this.requestContext.getClientVersion();
-    const paymentId = parseInt(id, 10);
-
-    this.logger.logWithContext('Updating payment', {
-      requestId,
-      clientVersion,
-      entityId: paymentId.toString(),
-      entityType: 'payment',
-      operation: 'update',
-    });
-
-    const payment = await this.prisma.payment.findUnique({
-      where: { id: paymentId },
-    });
-    if (!payment) {
-      throw new NotFoundException(`Payment #${paymentId} not found`);
-    }
-
-    if (updatePaymentDto.status !== undefined) {
-      const allowed = ALLOWED_TRANSITIONS[payment.status] ?? [];
-      if (!allowed.includes(updatePaymentDto.status)) {
-        throw new BadRequestException(
-          `Cannot transition payment from ${payment.status} to ${updatePaymentDto.status}`,
-        );
-      }
-    }
-
-    const updatedPayment = await this.prisma.payment.update({
-      where: { id: paymentId },
-      data: updatePaymentDto,
-    });
-
-    // Record status change in history table (best-effort, non-blocking)
-    if (updatePaymentDto.status !== undefined) {
-      void this.statusHistory.recordStatusChange({
-        paymentId: payment.id,
-        fromStatus: payment.status,
-        toStatus: updatePaymentDto.status,
-        changedBy: 'api',
-        metadata: { requestId },
-      });
-    }
-
-    if (updatePaymentDto.status === PaymentStatus.CONFIRMED) {
-      this.eventEmitter.emit(
-        'payment.completed',
-        new PaymentCompletedEvent(
-          updatedPayment.id,
-          updatedPayment.amount,
-          updatedPayment.currency,
-          updatedPayment.userId,
-        ),
-      );
-    } else if (updatePaymentDto.status === PaymentStatus.FAILED) {
-      this.metrics.incrementPaymentsFailed('user_action');
-      this.eventEmitter.emit(
-        'payment.failed',
-        new PaymentFailedEvent(
-          updatedPayment.id,
-          updatedPayment.amount,
-          updatedPayment.currency,
-          updatedPayment.userId,
-        ),
-      );
-    }
-
-    return updatedPayment;
-  }
-
-  remove(id: string) {
-    return `This action removes payment ${id}`;
-  }
-}
+/* … truncated 4173 chars — edit only what you need near the top … */
