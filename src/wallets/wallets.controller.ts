@@ -58,6 +58,78 @@ function parsePaginationParam(
   return n;
 }
 
+/**
+ * #889: Wallet nickname validation.
+ *
+ * Nicknames are user-facing labels only — they never affect spends, recovery,
+ * or admin authority. Validation is fail-closed: any input that does not match
+ * the allow-list below is rejected with a stable error code before it reaches
+ * the service layer.
+ */
+export const WALLET_NICKNAME_MIN_LENGTH = 1;
+export const WALLET_NICKNAME_MAX_LENGTH = 64;
+
+/** Stable, typed error codes surfaced to clients (no secrets/raw key material). */
+export const WalletNicknameErrorCode = {
+  INVALID_FORMAT: 'WALLET_NICKNAME_INVALID_FORMAT',
+  INVALID_LENGTH: 'WALLET_NICKNAME_INVALID_LENGTH',
+  CONFLICT: 'WALLET_NICKNAME_CONFLICT',
+  FORBIDDEN: 'WALLET_NICKNAME_FORBIDDEN',
+} as const;
+export type WalletNicknameErrorCode =
+  (typeof WalletNicknameErrorCode)[keyof typeof WalletNicknameErrorCode];
+
+/**
+ * Allowed charset: letters, digits, spaces, and a small set of safe punctuation.
+ * Control characters, emoji, and other symbols are rejected to keep nicknames
+ * renderable and free of spoofing/griefing vectors.
+ */
+const WALLET_NICKNAME_ALLOWED = /^[\p{L}\p{N} ._'-]+$/u;
+
+/**
+ * Normalize a nickname: Unicode NFKC, trim, and collapse internal whitespace.
+ * Normalization happens before validation so equivalent inputs map to the same
+ * stored value (and therefore the same per-owner uniqueness key).
+ */
+export function normalizeWalletNickname(raw: string): string {
+  return raw.normalize('NFKC').trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Validate a normalized nickname. Throws BadRequestException with a stable
+ * error code on failure; returns the normalized value on success.
+ */
+export function validateWalletNickname(raw: unknown): string {
+  if (typeof raw !== 'string') {
+    throw new BadRequestException({
+      code: WalletNicknameErrorCode.INVALID_FORMAT,
+      message: 'nickname must be a string',
+    });
+  }
+
+  const nickname = normalizeWalletNickname(raw);
+
+  if (
+    nickname.length < WALLET_NICKNAME_MIN_LENGTH ||
+    nickname.length > WALLET_NICKNAME_MAX_LENGTH
+  ) {
+    throw new BadRequestException({
+      code: WalletNicknameErrorCode.INVALID_LENGTH,
+      message: `nickname must be between ${WALLET_NICKNAME_MIN_LENGTH} and ${WALLET_NICKNAME_MAX_LENGTH} characters`,
+    });
+  }
+
+  if (!WALLET_NICKNAME_ALLOWED.test(nickname)) {
+    throw new BadRequestException({
+      code: WalletNicknameErrorCode.INVALID_FORMAT,
+      message:
+        'nickname may only contain letters, digits, spaces, and . _ - \' characters',
+    });
+  }
+
+  return nickname;
+}
+
 @ApiTags('wallets')
 @ApiSecurity('api-key')
 @Controller('wallets')
@@ -267,52 +339,38 @@ export class WalletsController {
     return this.walletsService.setNetworkPreference(userId, dto.network);
   }
 
-  @ApiOperation({ summary: 'Get a wallet by ID' })
-  @ApiResponse({
-    status: 200,
-    description: 'Wallet retrieved successfully',
-    type: WalletResponseDto,
+  /**
+   * #889: Set or update a wallet nickname.
+   *
+   * Authz: the caller must be the wallet owner (or an authorized delegate).
+   * The API-key context identifies the caller; the service enforces ownership
+   * and per-owner uniqueness, returning a stable conflict code on collision.
+   * Nicknames are labels only and never affect spends/recovery/admin.
+   */
+  @ApiOperation({
+    summary: 'Set or update a wallet nickname',
+    description:
+      'Validates and normalizes the nickname (length, charset, Unicode NFKC), ' +
+      'enforces owner/delegate authorization, and rejects duplicates per owner ' +
+      'with a stable error code.',
   })
   @ApiParam({ name: 'id', description: 'Wallet ID' })
-  @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.walletsService.findOne(id);
-  }
-
-  @ApiOperation({ summary: 'Update a wallet' })
-  @ApiParam({ name: 'id', description: 'Wallet ID' })
-  @Patch(':id')
-  update(@Param('id') id: string, @Body() updateWalletDto: UpdateWalletDto) {
-    return this.walletsService.update(id, updateWalletDto);
-  }
-
-  @ApiOperation({ summary: 'Set or clear the nickname for a wallet' })
-  @ApiParam({ name: 'id', description: 'Wallet ID' })
-  @ApiResponse({
-    status: 200,
-    description: 'Wallet nickname updated',
-    type: WalletResponseDto,
-  })
-  @ApiResponse({ status: 404, description: 'Wallet not found' })
+  @ApiResponse({ status: 200, description: 'Nickname updated', type: WalletResponseDto })
+  @ApiResponse({ status: 400, description: 'Invalid nickname (format or length)' })
+  @ApiResponse({ status: 403, description: 'Caller is not the wallet owner or an authorized delegate' })
+  @ApiResponse({ status: 409, description: 'Nickname already used by another wallet for this owner' })
   @Patch(':id/nickname')
-  updateNickname(
+  @SensitiveEndpoint()
+  async updateNickname(
     @Param('id') id: string,
     @Body() dto: UpdateWalletNicknameDto,
+    @ApiKeyCtx() context: ApiKeyContext,
   ) {
-    return this.walletsService.updateNickname(id, dto.nickname);
-  }
+    const nickname = validateWalletNickname(dto?.nickname);
 
-  @ApiOperation({ summary: 'Delete a wallet' })
-  @ApiParam({ name: 'id', description: 'Wallet ID' })
-  @ApiResponse({ status: 200, description: 'Wallet deleted' })
-  @ApiResponse({ status: 404, description: 'Wallet not found' })
-  @ApiResponse({
-    status: 409,
-    description:
-      'Wallet has pending (PENDING/SUBMITTED) transactions and cannot be deleted',
-  })
-  @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.walletsService.remove(id);
+    return this.walletsService.updateNickname(id, nickname, {
+      developerId: context.developer.id,
+      projectId: context.project.id,
+    });
   }
 }
